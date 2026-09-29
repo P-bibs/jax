@@ -1452,34 +1452,106 @@ class InterpretTest(jtu.JaxTestCase):
 
     _kernel()
 
-  def test_more_barrier_completions_than_waits_raises(self):
+  @jtu.parameterized.parameters(False, True)
+  def test_not_awaiting_final_barrier_phase(self, allocate_again):
+    # A thread may skip the final completion of a barrier, unless it then
+    # allocates another barrier.
     @functools.partial(
         plgpu.kernel,
         out_type=jax.ShapeDtypeStruct((), jnp.int32),
-        scratch_types=dict(barrier_ref=plgpu.Barrier(num_arrivals=1)),
-        num_threads=2,
+        interpret=InterpretParams(),
+    )
+    def _kernel(out_ref):
+      def body(barrier_ref):
+        plgpu.barrier_arrive(barrier_ref)
+        plgpu.barrier_wait(barrier_ref)
+        plgpu.barrier_arrive(barrier_ref)
+
+      pl.run_scoped(body, plgpu.Barrier(num_arrivals=1))
+      if allocate_again:
+        pl.run_scoped(lambda _: None, plgpu.Barrier(num_arrivals=1))
+      out_ref[...] = 42
+
+    if allocate_again:
+      with self.assertRaisesRegex(
+        Exception, 
+        r'allocated a barrier after deallocating barrier \d+, but thread .+ had'
+        r' only observed that barrier up to phase 0, while it completed up to'
+        r' phase 1'
+        ):
+        _kernel()
+    else:
+      self.assertEqual(_kernel(), 42)
+
+  def test_some_threads_not_awaiting_final_barrier_phase_raises(self):
+    num_threads = 8
+
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        num_threads=num_threads,
         thread_name='t',
         interpret=InterpretParams(),
     )
-    def _kernel(out_ref, barrier_ref):
+    def _kernel(out_ref):
       thread_id = jax.lax.axis_index('t')
 
-      @pl.when(thread_id == 0)
-      def _():
-        plgpu.barrier_arrive(barrier_ref)
+      def body(barrier_ref, observed_ref):
+        @pl.when(thread_id == 0)
+        def _():
+          plgpu.barrier_arrive(barrier_ref)
+          plgpu.barrier_wait(observed_ref)
+          plgpu.barrier_arrive(barrier_ref)
 
-      @pl.when(thread_id == 1)
-      def _():
-        plgpu.barrier_wait(barrier_ref)
-        plgpu.barrier_arrive(barrier_ref)
-        out_ref[...] = 42
+        @pl.when(thread_id != 0)
+        def _():
+          plgpu.barrier_wait(barrier_ref)
+          plgpu.barrier_arrive(observed_ref)
+
+        # Only thread 7 skips the second completion.
+        @pl.when((thread_id != 0) & (thread_id != num_threads - 1))
+        def _():
+          plgpu.barrier_wait(barrier_ref)
+
+      pl.run_scoped(
+          body,
+          plgpu.Barrier(num_arrivals=1),
+          plgpu.Barrier(num_arrivals=num_threads - 1),
+          collective_axes='t',
+      )
+      pl.run_scoped(
+          lambda _: None, plgpu.Barrier(num_arrivals=1), collective_axes='t'
+      )
+      out_ref[...] = 42
 
     with self.assertRaisesRegex(
-        Exception,
-        r'When barrier \d+ was deallocated, thread Warpgroup\(.+\)'
-        r' had only observed barrier up to phase 0, but barrier completed up to'
-        r' phase 1.',
+        Exception, r'Warpgroup\(.+warpgroup_id=7\) allocated a barrier'
     ):
+      _kernel()
+
+  def test_warp_not_awaiting_final_barrier_phase_raises(self):
+    @functools.partial(
+        plgpu.kernel,
+        out_type=jax.ShapeDtypeStruct((), jnp.int32),
+        interpret=InterpretParams(),
+    )
+    def _kernel(out_ref):
+      def body(barrier_ref):
+        plgpu.barrier_arrive(barrier_ref)
+
+        @plgpu.warp_map
+        def _per_warp(warp_id):
+          @pl.when(warp_id == 0)
+          def _():
+            plgpu.barrier_wait(barrier_ref)
+
+        plgpu.barrier_arrive(barrier_ref)
+
+      pl.run_scoped(body, plgpu.Barrier(num_arrivals=1))
+      pl.run_scoped(lambda _: None, plgpu.Barrier(num_arrivals=1))
+      out_ref[...] = 42
+
+    with self.assertRaisesRegex(Exception, r'thread Warp\(.+warp_id=0\)'):
       _kernel()
 
   @jtu.parameterized.named_parameters(

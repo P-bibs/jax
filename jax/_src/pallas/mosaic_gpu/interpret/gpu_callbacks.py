@@ -849,6 +849,7 @@ def _allocate_barriers(
 
     shared_memory.allocate_barrier(
         key,
+        thread,
         ref_count=ref_count_as_int,
         num_arrivals=num_arrivals_as_int,
         orders_tensor_core=orders_tensor_core_as_bool,
@@ -929,6 +930,7 @@ def _deallocate_barrier(
     barrier_allocation_key = HostAllocationKey.from_array(key)
     deallocate_fn(
         barrier_allocation_key,
+        thread,
         logging_info=memory.GPULoggingInfo(mesh_location, thread, source_info),
     )
   return token
@@ -1167,6 +1169,7 @@ def _allocate_cluster_barriers(
 
     shared_memory.allocate_cluster_barrier(
         key,
+        thread,
         axes_dims=axes_dims,
         is_axis_collective=is_axis_collective,
         ref_count=ref_count_as_int,

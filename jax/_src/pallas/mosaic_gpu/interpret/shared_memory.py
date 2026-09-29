@@ -492,6 +492,11 @@ class GPUSharedMemory(
   pending_tmem_stores: dict[Thread, VectorClock]
   pending_tmem_loads: dict[Thread, VectorClock]
 
+  # If a thread deallocates a barrier after awaiting it at least once but not
+  # fully, it gets added to this list and can't allocate barriers again without
+  # raising
+  corrupt_barrier_threads: dict[Thread, list[Barrier]]
+
   def __init__(
       self,
       *,
@@ -571,6 +576,7 @@ class GPUSharedMemory(
     self.num_blocks_per_cluster = num_blocks_per_cluster
     self.num_pallas_threads_per_block = num_threads_per_block
     self.reset_per_cluster_state()
+    self.corrupt_barrier_threads = collections.defaultdict(list)
 
   def buffer_shape_and_dtype(self, key: MemKey) -> memory.ShapeAndDtype:
     """The logical shape and dtype of `key`'s buffer."""
@@ -656,6 +662,7 @@ class GPUSharedMemory(
       )
       self.pending_tmem_stores = {}
       self.pending_tmem_loads = {}
+      self.deallocated_barriers = collections.defaultdict(list)
 
   def _abort_waiters(self):
     # Called by `set_failed` while `self.lock` is held. Acquiring a barrier's
@@ -682,9 +689,20 @@ class GPUSharedMemory(
       self.next_regs_id[thread] = regs_id - 1
       return regs_id
 
+  def _check_barrier_allocation(self, thread: ThreadKey):
+    """Checks that `thread` may allocate a barrier. Requires `self.lock`."""
+    if thread in self.corrupt_barrier_threads:
+      raise ValueError(
+          f"Thread {thread} has deallocated a barrier after awaiting it at least"
+          " once but not in every phase, and is now attempting to allocate a"
+          " new barrier which is illegal. The barriers that were deallocated in this state are:"
+          f" {self.corrupt_barrier_threads[thread]}"
+      )
+
   def allocate_barrier(
       self,
       key: MemKey,
+      thread: ThreadKey,
       ref_count: int,
       num_arrivals: int,
       orders_tensor_core: bool,
@@ -692,6 +710,7 @@ class GPUSharedMemory(
   ):
     """Allocates a barrier with the given key unless it already exists."""
     with self.lock:
+      self._check_barrier_allocation(thread)
       if key not in self.mem:
         barrier = Barrier(
             self,
@@ -817,6 +836,7 @@ class GPUSharedMemory(
   def allocate_cluster_barrier(
       self,
       key: MemKey,
+      thread: ThreadKey,
       axes_dims: tuple[int, ...],
       is_axis_collective: tuple[bool, ...],
       ref_count: int,
@@ -825,6 +845,7 @@ class GPUSharedMemory(
   ):
     """Allocates a cluster barrier with the given key unless it already exists."""
     with self.lock:
+      self._check_barrier_allocation(thread)
       if key not in self.mem:
         barrier = ClusterBarrier(
             self,
@@ -1192,10 +1213,12 @@ class Barrier(memory.Allocation):
     with self.cv:
       return self.ref_count == 0
 
-  def deallocate(self):
+  def deallocate(self, thread: Thread):
     """Deallocates the `Barrier`."""
     with self.cv:
       self.ref_count -= 1
+      if self.last_observed_phase_by_thread[thread] != self.phase:
+        self.shared_memory.corrupt_barrier_threads.add(thread)
       if self.ref_count > 0:
         return
 
@@ -1204,13 +1227,6 @@ class Barrier(memory.Allocation):
             f"Barrier deallocated with {self.arrivals_count} arrivals pending."
         )
 
-      for tid, x in self.last_observed_phase_by_thread.items():
-        if x != self.phase:
-          raise ValueError(
-              f"When barrier {id(self)} was deallocated, thread {tid} had only"
-              f" observed barrier up to phase {x-1}, but barrier completed"
-              f" up to phase {self.phase - 1}."
-          )
 
   def abort(self):
     """Aborts the `Barrier`, waking up and failing all current waiters."""
@@ -1592,12 +1608,11 @@ class ClusterBarrier(memory.Allocation):
 
     barrier.wait(thread, logging_info)
 
-  def deallocate(self):
+  def deallocate(self, thread: Thread):
     """Deallocates the `ClusterBarrier`."""
+    del thread
     with self.lock:
       self.ref_count -= 1
-      if self.ref_count > 0:
-        return
 
       for barrier in self.barriers:
         barrier.deallocate()

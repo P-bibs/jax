@@ -596,7 +596,8 @@ def interpret_pallas_call(
   # barriers because barrier deallocation also checks that the barrier was used
   # correctly by the kernel/threads. (Specifically, it is checked that if a
   # thread has observed any completed barrier arrival, it has in fact observed
-  # all completed arrivals).
+  # all completed arrivals) (this restriction is relaxed if the thread does not
+  # later allocate any additional barriers).
   token = gpu_callbacks.call_assert_no_barriers_allocated(token)
 
   token = gpu_callbacks.call_clean_up_shared_memory(token)
